@@ -7,6 +7,9 @@
 [submodule "lib/account-abstraction"]
 	path = lib/account-abstraction
 	url = https://github.com/eth-infinitism/account-abstraction
-[submodule "lib/zksync-contracts"]
-	path = lib/zksync-contracts
-	url = https://github.com/cyfrin/zksync-contracts
+[submodule "lib/foundry-era-contracts"]
+	path = lib/foundry-era-contracts
+	url = https://github.com/cyfrin/foundry-era-contracts
+[submodule "lib/foundry-devops"]
+	path = lib/foundry-devops
+	url = https://github.com/cyfrin/foundry-devops

@@ -5,42 +5,67 @@ pragma solidity 0.8.24;
 import {
     IAccount,
     ACCOUNT_VALIDATION_SUCCESS_MAGIC
-} from "@matterlabs/zksync-contracts/l2/system-contracts/interfaces/IAccount.sol";
+} from "lib/foundry-era-contracts/src/system-contracts/contracts/interfaces/IAccount.sol";
 import {
     Transaction,
-    TransactionHelper
-} from "@matterlabs/zksync-contracts/l2/system-contracts/libraries/TransactionHelper.sol";
+    MemoryTransactionHelper
+} from "lib/foundry-era-contracts/src/system-contracts/contracts/libraries/MemoryTransactionHelper.sol";
 import {
     BOOTLOADER_FORMAL_ADDRESS,
     NONCE_HOLDER_SYSTEM_CONTRACT,
     DEPLOYER_SYSTEM_CONTRACT
-} from "@matterlabs/zksync-contracts/l2/system-contracts/Constants.sol";
+} from "lib/foundry-era-contracts/src/system-contracts/contracts/Constants.sol";
 import { SystemContractsCaller } from
-    "@matterlabs/zksync-contracts/l2/system-contracts/libraries/SystemContractsCaller.sol";
-import { INonceHolder } from "@matterlabs/zksync-contracts/l2/system-contracts/interfaces/INonceHolder.sol";
-import { Utils } from "@matterlabs/zksync-contracts/l2/system-contracts/libraries/Utils.sol";
+    "lib/foundry-era-contracts/src/system-contracts/contracts/libraries/SystemContractsCaller.sol";
+import { INonceHolder } from "lib/foundry-era-contracts/src/system-contracts/contracts/interfaces/INonceHolder.sol";
+import { Utils } from "lib/foundry-era-contracts/src/system-contracts/contracts/libraries/Utils.sol";
 import { SystemContractHelper } from
-    "@matterlabs/zksync-contracts/l2/system-contracts/libraries/SystemContractHelper.sol";
+    "lib/foundry-era-contracts/src/system-contracts/contracts/libraries/SystemContractHelper.sol";
 
 // OZ Imports
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 
+/**
+ * @title ZkMinimalAccount
+ * @author Patrick Collins
+ * @notice This code is for demo purposes only
+ * @dev The lifecycle of a type 113 (account abstraction aka 0x71) transaction is as follows:
+ *
+ * Phase 1: Validation
+ * 1. The user sends the transaction to the "zkSync API client" (sort of a "light node")
+ * Note: For phase 1 and phase 2, the msg.sender is the bootloader
+ * 2. The zkSync API client checks to see the the nonce is unique by querying the NonceHolder system contract
+ * 3. The zkSync API client calls validateTransaction, which MUST update the nonce
+ * 4. The zkSync API client checks the nonce is updated
+ * 5. The zkSync API client calls payForTransaction, or prepareForPaymaster & validateAndPayForPaymasterTransaction
+ * to see if the account can pay
+ * 6. The zkSync API client verifies that the bootloader gets paid
+ *
+ * Phase 2: Execution
+ * 7. The zkSync API client passes the validated transaction to the main node / sequencer (as of today, they are the
+ * same node)
+ * 8. The main node calls executeTransaction
+ * 9. If a paymaster was used, the postTransaction is called
+ */
 contract ZkMinimalAccount is Ownable, IAccount {
-    using TransactionHelper for Transaction;
+    // Ideally we use the calldata edition in a future version
+    using MemoryTransactionHelper for Transaction;
 
     /*//////////////////////////////////////////////////////////////
-                                 ERRORS
+                             ERRORS
     //////////////////////////////////////////////////////////////*/
     error ZkMinimalAccount__OnlyBootloader();
     error ZkMinimalAccount__FailedToPay();
+    error ZkMinimalAccount__NotEnoughMoneyInMinimalAccount();
     error ZkMinimalAccount__InvalidSignature();
     error ZkMinimalAccount__ExecutionFailed();
     error ZkMinimalAccount__NotFromBootloaderOrOwner();
+    error ZkMinimalAccount__NotFromBootloader();
 
     /*//////////////////////////////////////////////////////////////
-                               MODIFIERS
+                           MODIFIERS
     //////////////////////////////////////////////////////////////*/
     modifier onlyBootloader() {
         if (msg.sender != BOOTLOADER_FORMAL_ADDRESS) {
@@ -56,51 +81,33 @@ contract ZkMinimalAccount is Ownable, IAccount {
         _;
     }
 
-    // /**
-    //  * @dev Simulate the behavior of the EOA if it is called via `delegatecall`.
-    //  * Thus, the default account on a delegate call behaves the same as EOA on Ethereum.
-    //  * If all functions will use this modifier AND the contract will implement an empty payable fallback()
-    //  * then the contract will be indistinguishable from the EOA when called.
-    //  */
-    // modifier ignoreInDelegateCall() {
-    //     address codeAddress = SystemContractHelper.getCodeAddress();
-    //     if (codeAddress != address(this)) {
-    //         // If the function was delegate called, behave like an EOA.
-    //         assembly {
-    //             return(0, 0)
-    //         }
-    //     }
-
-    //     // Continue execution if not delegate called.
-    //     _;
-    // }
-
     /*//////////////////////////////////////////////////////////////
-                               FUNCTIONS
+                           FUNCTIONS
     //////////////////////////////////////////////////////////////*/
     constructor() Ownable(msg.sender) { }
 
     function validateTransaction(
         bytes32, /*txHash*/
-        bytes32 suggestedSignedHash,
-        Transaction calldata transaction
+        bytes32, /*suggestedSignedHash*/
+        Transaction memory transaction
     )
         external
         payable
         onlyBootloader
         returns (bytes4 magic)
     {
-        magic = _validateTransaction(suggestedSignedHash, transaction);
+        magic = _validateTransaction(bytes32(0), transaction);
+        return ACCOUNT_VALIDATION_SUCCESS_MAGIC; // return bytes(0) and Dustin thinks this will revert
     }
 
     function executeTransaction(
         bytes32, /*txHash*/
+        // This is the hash that is signed by the EoA by default?
         bytes32, /*suggestedSignedHash*/
         Transaction calldata transaction
     )
         external
         payable
-        // ignoreInDelegateCall
         requireFromBootloaderOrOwner
     {
         _executeTransaction(transaction);
@@ -120,6 +127,7 @@ contract ZkMinimalAccount is Ownable, IAccount {
     )
         external
         payable
+        onlyBootloader
     {
         bool success = _transaction.payToTheBootloader();
         if (!success) {
@@ -139,11 +147,16 @@ contract ZkMinimalAccount is Ownable, IAccount {
     }
 
     /*//////////////////////////////////////////////////////////////
-                          FUNCTIONS - INTERNAL
+                      FUNCTIONS - INTERNAL
     //////////////////////////////////////////////////////////////*/
+    /**
+     * @param - in the future, they may not support sending the signed hash. This is a parameter for convience
+     * only.
+     * @param transaction - the transaction to validate
+     */
     function _validateTransaction(
         bytes32, /*suggestedSignedHash*/
-        Transaction calldata transaction
+        Transaction memory transaction
     )
         internal
         returns (bytes4 magic)
@@ -154,7 +167,7 @@ contract ZkMinimalAccount is Ownable, IAccount {
         // Check for fee to pay
         uint256 totalRequiredBalance = transaction.totalRequiredBalance();
         if (totalRequiredBalance > address(this).balance) {
-            revert ZkMinimalAccount__FailedToPay();
+            revert ZkMinimalAccount__NotEnoughMoneyInMinimalAccount();
         }
 
         // Check signature
@@ -196,10 +209,23 @@ contract ZkMinimalAccount is Ownable, IAccount {
         );
     }
 
+    fallback() external {
+        // fallback of default account shouldn't be called by bootloader under no circumstances
+        if (msg.sender == BOOTLOADER_FORMAL_ADDRESS) {
+            revert ZkMinimalAccount__NotFromBootloader();
+        }
+    }
+
+    receive() external payable {
+        // If the contract is called directly, behave like an EOA.
+        // Note, that is okay if the bootloader sends funds with no calldata as it may be used for refunds/operator
+        // payments
+    }
+
     /*//////////////////////////////////////////////////////////////
-                             VIEW AND PURE
+                         VIEW AND PURE
     //////////////////////////////////////////////////////////////*/
-    function _isValidSignature(bytes calldata signature, bytes32 transactionHash) internal view returns (bool) {
+    function _isValidSignature(bytes memory signature, bytes32 transactionHash) internal view returns (bool) {
         bytes32 hash = MessageHashUtils.toEthSignedMessageHash(transactionHash);
         if (owner() != ECDSA.recover(hash, signature)) {
             return false;
